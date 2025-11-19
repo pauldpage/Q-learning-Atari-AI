@@ -1,24 +1,23 @@
 # Q-learning Atari AI
 
-(Game library) ▼
-
-You can change the game this AI learns by going to line 74 and changing the gym.make variable to any other game in the Open-AI gym library. Here is a link to all of the games. Some work better then others with this specific learning algorithm.  https://gym.openai.com/envs/#atari
-
-
-
-(Working enviroment ▼)
-
-This project was built with slightly older syntax from tensorflow 1.14.0-1.15.0 and may not work with some builds of tensorflow 2.0. I reccomend using a docker file or virtual enviroment if you regularly use tensorflow 2.
+(Emulator) ▼
+Open AI gym used to include the atari roms but now they need to be installed with a license using ALE-py. You can use many Atari games and optimize the network for each, I use Mspacman because it runs well. 
 
 
 
+(Main Scipt.py ▼)
 
-(repos) ▼
-
-Open-AI gym   https://github.com/openai/gym
-
-
-Numpy  https://github.com/numpy/numpy
+This project is forked from an older one using Tensorflow 1.15. This has been updated to TF 2.12.0 which has much easier syntax. This is a very simple script that creates the learning environment in real time with no save state feature. This is more of a functional demo because the learning rate is limited by frame rate and other factors. The network is also not well optimized for this type of environment. 
 
 
-Tensorflow 1.15.0 (downgrade if necessary)   https://github.com/tensorflow/tensorflow
+(Q.py ▼)
+
+
+
+(Packages) ▼
+
+TensorFlow 2.12.0 (Keras)
+
+Gymnasium 1.1.1 (Updated from OpenAI Gym)
+
+ALE-py 0.10.1
