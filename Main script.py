@@ -1,280 +1,119 @@
+import os
+import gymnasium as gym
+import ale_py
 import numpy as np
-import gym
 import tensorflow as tf
-from gym.wrappers.monitoring.video_recorder import VideoRecorder
-from collections import deque, Counter
-from tensorflow.contrib.layers import flatten, conv2d, fully_connected
+from tensorflow.keras import layers
 import random
-from datetime import datetime
-from gym import wrappers
-from time import time
+from collections import deque
+import cv2
 
-CONTRAST = np.array([210,164,74]).mean()
-EPSILON = 0.5
-MIN_EPSILON = 0.05
-MAX_EPSILON = 1
-EPS_DELTA_STEPS = 500000
-BUF_LENGTH = 20000
-NUM_EPISODES = 1200
-BATCH_SIZE = 50
-LEARNING_RATE = 0.1
-DISCOUNT_FACTOR = 0.97
-INPUT_SHAPE = (None, 88, 80, 1)
-X_SHAPE = (None, 88, 80, 1)
-STEPS_TRAIN = 4
-START_STEPS = 2000
-COPY_STEPS = 100
+# --- CHANGE DIRECTORY TO ROMS LOCATION OR IT WON'T WORK ---
+os.environ["ALE_ROM_DIR"] = "/Users/Directory/.atari_roms"
 
-exp_buffer = deque(maxlen=BUF_LENGTH)
-global_step = 0
+# Hyperparameters
+learning_rate = 0.00025
+gamma = 0.99
+epsilon = 1.0
+epsilon_decay = 0.997
+epsilon_min = 0.1
+episodes = 500
+max_steps = 5000
+frame_skip = 4           # Skip frames = speed up gameplay
+train_every = 4          # Train every 4 steps
+batch_size = 64
 
-def preprocess_image(obs):
-    res = obs[1:176:2, ::2]
-    res = res.mean(axis=2)
-    res[res==CONTRAST] = 0
-    res = (res-128)/128 - 1
-    return res.reshape(88, 80, 1)
+replay_memory = deque(maxlen=50000)
 
-def dqn(x, scope, n_outputs):
-    initializer = tf.contrib.layers.variance_scaling_initializer()
-    with tf.variable_scope(scope) as cur_scope:
-        layer1 = conv2d(x, num_outputs=32, kernel_size=(8,8), stride=4, padding='SAME',weights_initializer=initializer)
-        tf.summary.histogram('layer1', layer1)
+# Create MsPacman environment with live window 
+env = gym.make("ALE/MsPacman-v5", render_mode="human")
+num_actions = env.action_space.n
 
-        layer2 = conv2d(layer1, num_outputs=64, kernel_size=(4,4), stride=2, padding='SAME', weights_initializer=initializer)
-        tf.summary.histogram('layer2', layer2)
+# Preprocess frames 
+def preprocess_frame(frame):
+    gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
+    resized = cv2.resize(gray, (84, 84))
+    normalized = resized / 255.0
+    return normalized
 
-        layer3 = conv2d(layer2, num_outputs=64, kernel_size=(3, 3), stride=1, padding='SAME', weights_initializer=initializer)
-        tf.summary.histogram('layer3', layer3)
+# Build Q-network 
+def build_model():
+    model = tf.keras.Sequential([
+        layers.Input(shape=(84, 84, 1)),
+        layers.Conv2D(32, (8, 8), strides=4, activation='relu'),
+        layers.Conv2D(64, (4, 4), strides=2, activation='relu'),
+        layers.Conv2D(64, (3, 3), strides=1, activation='relu'),
+        layers.Flatten(),
+        layers.Dense(512, activation='relu'),
+        layers.Dense(num_actions, activation='linear')
+    ])
+    model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=learning_rate),
+                  loss='mse')
+    return model
 
-        flat = flatten(layer3)
+model = build_model()
 
-        fully_con = fully_connected(flat, num_outputs=128, weights_initializer=initializer)
-        tf.summary.histogram('fully_con', fully_con)
+#  Training function
+def replay_train():
+    if len(replay_memory) < batch_size:
+        return
 
-        output = fully_connected(fully_con, num_outputs=n_outputs, activation_fn=None, weights_initializer=initializer)
-        tf.summary.histogram('output', output)
+    minibatch = random.sample(replay_memory, batch_size)
+    states = np.array([m[0] for m in minibatch])
+    next_states = np.array([m[3] for m in minibatch])
 
-        params = {v.name[len(cur_scope.name): ]: v for v in tf.get_collection(key=tf.GraphKeys.TRAINABLE_VARIABLES, scope=cur_scope.name)}
-        return params, output
 
-def get_sample(batch_size):
-    perm_batch = np.random.permutation(len(exp_buffer))[:batch_size]
-    mem = np.array(exp_buffer)[perm_batch]
-    return mem[:,0], mem[:,1], mem[:,2], mem[:,3], mem[:,4]
+    if len(states.shape) == 3:
+        states = np.expand_dims(states, axis=-1)
+    if len(next_states.shape) == 3:
+        next_states = np.expand_dims(next_states, axis=-1)
 
-def epsilon_greedy(action, step):
-    p = np.random.random(1).squeeze()
-    epsilon = max(MIN_EPSILON, MAX_EPSILON - (MAX_EPSILON - MIN_EPSILON) * step/EPS_DELTA_STEPS)
-    if np.random.rand() < epsilon:
-        return np.random.randint(n_outputs)
-    else:
-        return action
+    q_values = model.predict(states, verbose=0)
+    q_next_values = model.predict(next_states, verbose=0)
 
-env = gym.make("MsPacman-v0")
-n_outputs = env.action_space.n
-tf.reset_default_graph()
+    for i, (state, action, reward, next_state, done) in enumerate(minibatch):
+        target = reward if done else reward + gamma * np.max(q_next_values[i])
+        q_values[i][action] = target
 
-x = tf.placeholder(tf.float32, shape=X_SHAPE)
-y = tf.placeholder(tf.float32, shape=(None,1))
-in_training_mode = tf.placeholder(tf.bool)
+    model.fit(states, q_values, batch_size=batch_size, verbose=0)
 
-main_dqn, main_dqn_outputs = dqn(x, 'mainQ', n_outputs)
-target_dqn, target_dqn_outputs = dqn(x, 'targetQ', n_outputs)
+# --- Training Loop ---
+for ep in range(episodes):
+    obs, _ = env.reset()
+    state = preprocess_frame(obs)
+    state = np.expand_dims(state, axis=-1)
+    total_reward = 0
 
-x_action = tf.placeholder(tf.int32, shape=(None,))
-q_action = tf.reduce_sum(target_dqn_outputs * tf.one_hot(x_action, n_outputs), axis=-1, keep_dims=True)
+    for step in range(max_steps):
+        # Epsilon action
+        if np.random.rand() < epsilon:
+            action = env.action_space.sample()
+        else:
+            q_vals = model.predict(np.expand_dims(state, axis=0), verbose=0)
+            action = np.argmax(q_vals)
 
-copy_operation = [tf.assign(main_name, target_dqn[var_name]) for var_name, main_name in main_dqn.items()]
-copy_target_to_main = tf.group(*copy_operation)
+        reward_sum = 0
+        for _ in range(frame_skip):  # Skip frames to speed up learning
+            obs, reward, terminated, truncated, _ = env.step(action)
+            reward_sum += reward
+            if terminated or truncated:
+                break
 
-loss = tf.reduce_mean(tf.square(y-q_action))
-optimizer = tf.train.AdamOptimizer(LEARNING_RATE)
-training_operation = optimizer.minimize(loss)
+        next_state = preprocess_frame(obs)
+        next_state = np.expand_dims(next_state, axis=-1)
 
-init = tf.global_variables_initializer()
+        replay_memory.append((state, action, reward_sum, next_state, terminated or truncated))
+        state = next_state
+        total_reward += reward_sum
 
-loss_summary = tf.summary.scalar('LOSS', loss)
-merge_summary = tf.summary.merge_all()
+        # Train every few steps
+        if step % train_every == 0:
+            replay_train()
 
-with tf.Session() as session:
-    init.run()
+        if terminated or truncated:
+            break
 
-    for i in range(NUM_EPISODES):
-        done = False
-        obs = env.reset()
-        env.render()
-        epoch = 0
-        episodic_reward = 0
-        actions_counter = Counter()
-        episodic_loss = []
+    epsilon = max(epsilon_min, epsilon * epsilon_decay)
+    print(f"Episode {ep+1}/{episodes} - Total Reward: {total_reward:.2f} - Epsilon: {epsilon:.3f}")
 
-        while not done:
-
-            env.render()
-            obs = preprocess_image(obs)
-            actions = main_dqn_outputs.eval(feed_dict={x:[obs], in_training_mode:False})
-            action = np.argmax(actions, axis=-1)
-            actions_counter[str(action)] += 1
-            action = epsilon_greedy(action, global_step)
-            next_obs, reward, done, _ = env.step(action)
-            exp_buffer.append([obs, action, preprocess_image(next_obs), reward, done])
-
-            if global_step % STEPS_TRAIN == 0 and global_step > START_STEPS:
-                o_obs, o_act, o_next_obs, o_reward, o_done = get_sample(BATCH_SIZE)
-                o_obs = [x for x in o_obs]
-                o_next_obs = [x for x in o_next_obs]
-                next_act = main_dqn_outputs.eval(feed_dict={x:o_next_obs, in_training_mode:False})
-                y_batch = o_reward + DISCOUNT_FACTOR * np.max(next_act, axis=-1) * (1-o_done)
-
-                train_loss, _ = session.run([loss, training_operation], feed_dict={x:o_obs, y:np.expand_dims(y_batch, axis=-1),
-                                                                                   x_action: o_act, in_training_mode:True})
-                episodic_loss.append(train_loss)
-
-            if (global_step+1)%COPY_STEPS == 0 and global_step > START_STEPS:
-                copy_target_to_main.run()
-
-            obs=next_obs
-            epoch+=1
-            global_step+=1import numpy as np
-import gym
-import tensorflow as tf
-from gym.wrappers.monitoring.video_recorder import VideoRecorder
-from collections import deque, Counter
-from tensorflow.contrib.layers import flatten, conv2d, fully_connected
-import random
-from datetime import datetime
-from gym import wrappers
-from time import time
-
-CONTRAST = np.array([210,164,74]).mean()
-EPSILON = 0.5
-MIN_EPSILON = 0.05
-MAX_EPSILON = 1
-EPS_DELTA_STEPS = 500000
-BUF_LENGTH = 20000
-NUM_EPISODES = 1200
-BATCH_SIZE = 50
-LEARNING_RATE = 0.1
-DISCOUNT_FACTOR = 0.97
-INPUT_SHAPE = (None, 88, 80, 1)
-X_SHAPE = (None, 88, 80, 1)
-STEPS_TRAIN = 4
-START_STEPS = 2000
-COPY_STEPS = 100
-
-exp_buffer = deque(maxlen=BUF_LENGTH)
-global_step = 0
-
-def preprocess_image(obs):
-    res = obs[1:176:2, ::2]
-    res = res.mean(axis=2)
-    res[res==CONTRAST] = 0
-    res = (res-128)/128 - 1
-    return res.reshape(88, 80, 1)
-
-def dqn(x, scope, n_outputs):
-    initializer = tf.contrib.layers.variance_scaling_initializer()
-    with tf.variable_scope(scope) as cur_scope:
-        layer1 = conv2d(x, num_outputs=32, kernel_size=(8,8), stride=4, padding='SAME',weights_initializer=initializer)
-        tf.summary.histogram('layer1', layer1)
-
-        layer2 = conv2d(layer1, num_outputs=64, kernel_size=(4,4), stride=2, padding='SAME', weights_initializer=initializer)
-        tf.summary.histogram('layer2', layer2)
-
-        layer3 = conv2d(layer2, num_outputs=64, kernel_size=(3, 3), stride=1, padding='SAME', weights_initializer=initializer)
-        tf.summary.histogram('layer3', layer3)
-
-        flat = flatten(layer3)
-
-        fully_con = fully_connected(flat, num_outputs=128, weights_initializer=initializer)
-        tf.summary.histogram('fully_con', fully_con)
-
-        output = fully_connected(fully_con, num_outputs=n_outputs, activation_fn=None, weights_initializer=initializer)
-        tf.summary.histogram('output', output)
-
-        params = {v.name[len(cur_scope.name): ]: v for v in tf.get_collection(key=tf.GraphKeys.TRAINABLE_VARIABLES, scope=cur_scope.name)}
-        return params, output
-
-def get_sample(batch_size):
-    perm_batch = np.random.permutation(len(exp_buffer))[:batch_size]
-    mem = np.array(exp_buffer)[perm_batch]
-    return mem[:,0], mem[:,1], mem[:,2], mem[:,3], mem[:,4]
-
-def epsilon_greedy(action, step):
-    p = np.random.random(1).squeeze()
-    epsilon = max(MIN_EPSILON, MAX_EPSILON - (MAX_EPSILON - MIN_EPSILON) * step/EPS_DELTA_STEPS)
-    if np.random.rand() < epsilon:
-        return np.random.randint(n_outputs)
-    else:
-        return action
-
-env = gym.make("MsPacman-v0")
-n_outputs = env.action_space.n
-tf.reset_default_graph()
-
-x = tf.placeholder(tf.float32, shape=X_SHAPE)
-y = tf.placeholder(tf.float32, shape=(None,1))
-in_training_mode = tf.placeholder(tf.bool)
-
-main_dqn, main_dqn_outputs = dqn(x, 'mainQ', n_outputs)
-target_dqn, target_dqn_outputs = dqn(x, 'targetQ', n_outputs)
-
-x_action = tf.placeholder(tf.int32, shape=(None,))
-q_action = tf.reduce_sum(target_dqn_outputs * tf.one_hot(x_action, n_outputs), axis=-1, keep_dims=True)
-
-copy_operation = [tf.assign(main_name, target_dqn[var_name]) for var_name, main_name in main_dqn.items()]
-copy_target_to_main = tf.group(*copy_operation)
-
-loss = tf.reduce_mean(tf.square(y-q_action))
-optimizer = tf.train.AdamOptimizer(LEARNING_RATE)
-training_operation = optimizer.minimize(loss)
-
-init = tf.global_variables_initializer()
-
-loss_summary = tf.summary.scalar('LOSS', loss)
-merge_summary = tf.summary.merge_all()
-
-with tf.Session() as session:
-    init.run()
-
-    for i in range(NUM_EPISODES):
-        done = False
-        obs = env.reset()
-        env.render()
-        epoch = 0
-        episodic_reward = 0
-        actions_counter = Counter()
-        episodic_loss = []
-
-        while not done:
-
-            env.render()
-            obs = preprocess_image(obs)
-            actions = main_dqn_outputs.eval(feed_dict={x:[obs], in_training_mode:False})
-            action = np.argmax(actions, axis=-1)
-            actions_counter[str(action)] += 1
-            action = epsilon_greedy(action, global_step)
-            next_obs, reward, done, _ = env.step(action)
-            exp_buffer.append([obs, action, preprocess_image(next_obs), reward, done])
-
-            if global_step % STEPS_TRAIN == 0 and global_step > START_STEPS:
-                o_obs, o_act, o_next_obs, o_reward, o_done = get_sample(BATCH_SIZE)
-                o_obs = [x for x in o_obs]
-                o_next_obs = [x for x in o_next_obs]
-                next_act = main_dqn_outputs.eval(feed_dict={x:o_next_obs, in_training_mode:False})
-                y_batch = o_reward + DISCOUNT_FACTOR * np.max(next_act, axis=-1) * (1-o_done)
-
-                train_loss, _ = session.run([loss, training_operation], feed_dict={x:o_obs, y:np.expand_dims(y_batch, axis=-1),
-                                                                                   x_action: o_act, in_training_mode:True})
-                episodic_loss.append(train_loss)
-
-            if (global_step+1)%COPY_STEPS == 0 and global_step > START_STEPS:
-                copy_target_to_main.run()
-
-            obs=next_obs
-            epoch+=1
-            global_step+=1
-            episodic_reward+=reward
-
-            episodic_reward+=reward
+env.close()
